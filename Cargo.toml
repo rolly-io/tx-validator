@@ -1,0 +1,25 @@
+[package]
+name = "rolly-tx-validator"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mykola N"]
+description = "Native, circuit-aligned per-tx-type slot validator: re-checks every per-slot constraint on a candidate witness before it mutates state, returning a typed rejection instead of poisoning the block proof"
+
+# Plain rlib (NO wasm-bindgen / getrandom(js)) so the prover circuit crate can
+# dev-depend on this natively (x86/arm) for the differential test. The thin
+# `#[wasm_bindgen] validate_slot` wrapper for the backend lives in wasm-signer
+# and only forwards into this crate.
+[lib]
+name = "tx_validator"
+
+[dependencies]
+# Payout / prediction-hash defense-in-depth layer (same git source as circuit
+# and wasm-signer to avoid duplicate crate versions).
+rolly-game-core = { git = "https://github.com/rolly-io/games-core" }
+
+# Poseidon2 hashing only — must match circuit's git source/features so the
+# workspace resolves a single plonky2 build.
+plonky2 = { git = "https://github.com/rolly-io/plonky2", features = ["parallel"] }
+plonky2_field = { git = "https://github.com/rolly-io/plonky2" }
+
+serde = { version = "1.0", features = ["derive"] }
