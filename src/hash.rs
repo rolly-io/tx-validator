@@ -143,7 +143,7 @@ pub fn random_crash(server_seed: [u64; 8]) -> [u64; 4] {
 ///
 /// circuit `build_fairness_constraints` (slot/fairness.rs); wasm
 /// `seed_hash_truncated`. The fourth element is discarded (192 bits, ~96-bit
-/// collision resistance — CLAUDE.md MED-2).
+/// collision resistance — AGENTS.md MED-2).
 pub fn seed_hash_truncated(server_seed: [u64; 8]) -> [u64; 3] {
     let h = poseidon2(&server_seed);
     [h[0], h[1], h[2]]

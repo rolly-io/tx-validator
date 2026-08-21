@@ -112,6 +112,27 @@ pub(crate) fn check_fairness(
     })
 }
 
+/// Sort `keno_selected` into the canonical order the prediction hash is built
+/// over and reject anything `keno::compute_payout` would panic on.
+///
+/// `SlotInput` is deserialized from untrusted JSON, so the pick set can be
+/// empty, out of range, or contain repeats — none of which the game-core
+/// helpers tolerate. Screening here keeps a malformed slot a typed rejection
+/// instead of a panic that would take the whole validator down.
+fn sorted_keno_picks(input: &SlotInput) -> Result<Vec<u8>, SlotRejection> {
+    let mut sorted = input.keno_selected.clone();
+    sorted.sort_unstable();
+
+    let risk = input.game_mode as u8;
+    if input.game_mode > 2
+        || !keno::validate_selected(&sorted)
+        || keno::get_multiplier_table(risk, sorted.len() as u8).is_none()
+    {
+        return Err(SlotRejection::PayoutMismatch);
+    }
+    Ok(sorted)
+}
+
 /// Verify that `prediction_hash` in the witness matches the raw game params.
 fn verify_prediction_hash(
     input: &SlotInput,
@@ -119,8 +140,7 @@ fn verify_prediction_hash(
 ) -> Result<(), SlotRejection> {
     let gid = input.game_id as u64;
     let expected = if input.game_id == keno::KENO_GAME_ID {
-        let mut sorted = input.keno_selected.clone();
-        sorted.sort();
+        let sorted = sorted_keno_picks(input)?;
         hash::prediction_hash_keno(
             gid,
             input.game_mode as u64,  // risk
@@ -190,10 +210,9 @@ fn dispatch_payout(
             Ok(payout.win_amount)
         }
         id if id == keno::KENO_GAME_ID => {
-            let risk = input.game_mode as u8;
-            let mut sorted = input.keno_selected.clone();
-            sorted.sort();
-            let payout = keno::compute_payout(random, bet, risk, &sorted);
+            let sorted = sorted_keno_picks(input)?;
+            let payout =
+                keno::compute_payout(random, bet, input.game_mode as u8, &sorted);
             Ok(payout.win_amount)
         }
         id if id == plinko::PLINKO_GAME_ID => {
@@ -662,6 +681,61 @@ mod tests {
 
         let result = check_fairness(&inp, &flags_ihb());
         assert!(result.is_ok(), "valid keno IHB must pass: {:?}", result);
+    }
+
+    #[test]
+    fn ihb_keno_malformed_picks_are_typed_rejections() {
+        let ss = [7u64, 8, 9, 10, 11, 12, 13, 14];
+        let secret = [70u64, 80, 90, 100];
+        let bet = 1_000_000u64;
+
+        let cases: Vec<(&str, u32, Vec<u8>)> = vec![
+            ("repeated tile", 0, vec![5, 5]),
+            ("no picks", 0, vec![]),
+            ("tile out of range", 0, vec![40]),
+            ("more than ten picks", 0, (0..11u8).collect()),
+            ("risk out of range", 3, vec![1, 2]),
+        ];
+
+        for (label, risk, selected) in cases {
+            let mut sorted = selected.clone();
+            sorted.sort_unstable();
+
+            let prediction_hash = hash::prediction_hash_keno(
+                keno::KENO_GAME_ID as u64,
+                risk as u64,
+                sorted.len() as u64,
+                &sorted,
+            );
+            let user_seed = hash::user_seed_binding(
+                keno::KENO_GAME_ID as u64,
+                bet,
+                prediction_hash,
+                secret,
+            );
+
+            let inp = SlotInput {
+                tx_type: crate::TX_IN_HOUSE_BET,
+                game_id: keno::KENO_GAME_ID,
+                amount: bet,
+                win_amount: 0,
+                server_seed: ss,
+                user_seed,
+                old_seed_hash: hash::seed_hash_truncated(ss),
+                next_server_seed_hash: [801, 802, 803],
+                user_secret_random: secret,
+                prediction_hash,
+                game_mode: risk,
+                keno_selected: selected,
+                ..SlotInput::default()
+            };
+
+            assert_eq!(
+                check_fairness(&inp, &flags_ihb()),
+                Err(SlotRejection::PayoutMismatch),
+                "{label} must be rejected without panicking",
+            );
+        }
     }
 
     // ── slot_h matches manual computation ──
