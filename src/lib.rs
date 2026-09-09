@@ -17,10 +17,18 @@ pub mod field;
 pub mod hash;
 pub mod merkle;
 
-// Per-type effect layers (balance/credit, address/pk, session auth). Internal
+// Blackjack shoe unfold + native payout reproduction. Public so the witness
+// engine can reuse it to GENERATE the win / total stake (blackjack's win is a
+// function of the dealt shoe + actions, not the fairness `random`), the same
+// value this crate's payout layer re-checks.
+pub mod blackjack;
+
+// Per-type effect layers (balance/credit, address/pk, auth-set decode). Internal
 // to the validator; the public surface stays `validate_slot` + the I/O types.
 // Each mirrors one circuit module so the second implementation tracks the first.
 mod address;
+pub use address::recipient_addr_hash_for;
+mod allowance;
 mod auth;
 mod balance;
 mod fairness;
@@ -34,8 +42,9 @@ pub const TREE_DEPTH: usize = 28;
 
 /// Highest valid transaction type. Types are `0..=MAX_TX_TYPE` inclusive
 /// (noop, deposit, bet, win, bonus, in_house_bet, withdrawal, risk_reject,
-/// set_init_seed_hash, key_register_only, transfer, referral, crash_settle).
-pub const MAX_TX_TYPE: u8 = 12;
+/// set_init_seed_hash, key_register_only, transfer, referral, crash_settle,
+/// set_provider_allowance).
+pub const MAX_TX_TYPE: u8 = 13;
 
 // Transaction type discriminants — mirror the circuit's one-hot decode in
 // `slot/tx_flags.rs`. Named here so the per-type effect layer (follow-up
@@ -53,6 +62,42 @@ pub const TX_KEY_REGISTER_ONLY: u8 = 9;
 pub const TX_TRANSFER: u8 = 10;
 pub const TX_REFERRAL: u8 = 11;
 pub const TX_CRASH_SETTLE: u8 = 12;
+/// The account owner sets the absolute provider allowance (`amount`) that caps
+/// future provider `bet` debits; `amount = 0` revokes it. Schnorr-signed on the
+/// game lane. See [`allowance`].
+pub const TX_SET_PROVIDER_ALLOWANCE: u8 = 13;
+
+// ── Two-lane anti-replay nonce (mirror of the circuit's `slot/nonce.rs`) ──
+//
+// `nonce = account_lane · 2^40 + game_lane`. in_house_bet / crash_settle /
+// set_provider_allowance bump (and sign) the game lane; withdrawal / transfer /
+// key_register bump (and sign) the account lane, so a bet landing while a
+// withdrawal awaits approval cannot stale the withdrawal's signature.
+// `account_lane < 2^23` keeps the packed value below 2^63 < p, so the split is
+// canonical.
+
+/// Width of the game lane (bits `0..40`).
+pub const GAME_LANE_BITS: u32 = 40;
+/// Width of the account lane (bits `40..63`).
+pub const ACCOUNT_LANE_BITS: u32 = 23;
+/// Highest storable game-lane value; a bump past it is rejected.
+pub const GAME_LANE_MAX: u64 = (1u64 << GAME_LANE_BITS) - 1;
+/// Highest storable account-lane value; a bump past it is rejected.
+pub const ACCOUNT_LANE_MAX: u64 = (1u64 << ACCOUNT_LANE_BITS) - 1;
+/// Weight of one account-lane step in the packed leaf nonce (`2^40`).
+pub const ACCOUNT_LANE_UNIT: u64 = 1u64 << GAME_LANE_BITS;
+
+/// Decompose a packed leaf nonce into `(account_lane, game_lane)`.
+pub fn split_nonce(nonce: u64) -> (u64, u64) {
+    (nonce >> GAME_LANE_BITS, nonce & GAME_LANE_MAX)
+}
+
+/// Inverse of [`split_nonce`]; lanes must be within their widths.
+pub fn join_nonce(account_lane: u64, game_lane: u64) -> u64 {
+    debug_assert!(account_lane <= ACCOUNT_LANE_MAX, "account lane overflows 23 bits");
+    debug_assert!(game_lane <= GAME_LANE_MAX, "game lane overflows 40 bits");
+    (account_lane << GAME_LANE_BITS) | game_lane
+}
 
 /// Full candidate witness for one slot, mirroring the circuit's native
 /// `SlotWitness`, plus the ambient block state the validator checks against
@@ -72,6 +117,14 @@ pub struct SlotInput {
     pub win_amount: u64,
     pub old_balance: u64,
     pub old_deposit_credit: u64,
+    pub old_nonce: u64,
+    /// Provider allowance stored in the OLD leaf (62 bits; packed above the
+    /// balance limbs — see [`allowance`] / `field::pack_balance_fields`). `0`
+    /// for every pre-allowance leaf and for accounts that never granted one,
+    /// hence `serde(default)`: a caller that predates the field describes
+    /// exactly such a leaf.
+    #[serde(default)]
+    pub old_provider_allowance: u64,
     pub main_siblings: [[u64; 4]; TREE_DEPTH],
 
     pub server_seed: [u64; 8],
@@ -79,14 +132,18 @@ pub struct SlotInput {
     pub old_seed_hash: [u64; 3],
     pub next_server_seed_hash: [u64; 3],
 
-    pub session_key: [u64; 4],
-    pub session_expiry: u64,
-
     pub old_pk_hash: [u64; 4],
     pub new_pk_hash: [u64; 4],
 
     pub user_address: [u8; 20],
     pub old_address_hash: [u64; 4],
+
+    /// `Poseidon2(recipient_address)[0..2]` — payout counterparty (Rolly hot
+    /// wallet). A signed input carried into `tx_hash`. F6: must equal
+    /// [`recipient_addr_hash_for`]`(tx_type, user_address)` — the hash of the
+    /// address a withdrawal pays, `[0, 0]` on every other type.
+    #[serde(default)]
+    pub recipient_addr_hash: [u64; 2],
 
     pub old_total_liability: u64,
 
@@ -99,9 +156,6 @@ pub struct SlotInput {
     pub current_root: [u64; 4],
     /// Current total-liability the slot's `old_total_liability` must equal (C18).
     pub current_tl: u64,
-    /// `now + MAX_BLOCK_LATENCY`: session expiry must be `>=` this (C14).
-    pub max_block_timestamp: u64,
-
     // --- raw game params (payout layer only: in_house_bet / crash_settle) ---
     // The witness carries only `prediction_hash` and `win_amount`, but
     // `compute_payout` / `compute_prediction_hash` need the raw parameters to
@@ -112,6 +166,15 @@ pub struct SlotInput {
     pub prediction_lo: u32,
     #[serde(default)]
     pub prediction_hi: u32,
+
+    /// Blackjack only: the base stake in atomic units. The rollup slot records
+    /// the TOTAL staked (`amount` = base + doubles + splits + insurance); the
+    /// payout layer re-derives both the total and the win by replaying the
+    /// round from this base stake, because blackjack's win depends on the dealt
+    /// shoe + actions rather than on `random`. Zero / unused for every other
+    /// game (matching the circuit's blackjack entry witness `base_bet`).
+    #[serde(default)]
+    pub base_bet: u64,
 
     /// Keno-only: the player's selected numbers (0-indexed, 1..=10 unique values
     /// in `[0, 39]`). Needed for the 13-element `prediction_hash_keno` and
@@ -137,6 +200,19 @@ pub struct SlotEffects {
     pub new_balance: u64,
     pub new_credit: u64,
     pub new_seed_hash: [u64; 3],
+    /// Full packed leaf nonce (`new_account_nonce · 2^40 + new_game_nonce`) —
+    /// what is hashed into the new leaf and exported in pubdata.
+    pub new_nonce: u64,
+    /// Game lane of `new_nonce`: the counter the next `in_house_bet` /
+    /// `crash_settle` signature must commit to.
+    pub new_game_nonce: u64,
+    /// Account lane of `new_nonce`: the counter the next `withdrawal` /
+    /// `transfer` signature (and EIP-712 key registration) must commit to.
+    pub new_account_nonce: u64,
+    /// Absolute post-tx provider allowance (62 bits): `amount` after a
+    /// `set_provider_allowance`, `old − amount` after a provider `bet`,
+    /// unchanged otherwise. Packed into the new leaf and published in pubdata.
+    pub new_provider_allowance: u64,
     pub new_pk_hash: [u64; 4],
     pub new_address_hash: [u64; 4],
     pub new_root: [u64; 4],
@@ -157,7 +233,7 @@ pub struct SlotEffects {
 /// bricking the block proof. Annotated with the constraint it guards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotRejection {
-    /// tx_type outside `0..=12` (C1: `flag_sum == 1`).
+    /// tx_type outside `0..=13` (C1: `flag_sum == 1`).
     BadTxType,
     /// An amount limb (amount/win/balance/credit, lo or hi) is `>= 2^32` (C2).
     AmountLimbOverflow,
@@ -184,19 +260,32 @@ pub enum SlotRejection {
     CreditCapMismatch,
     /// A signed tx type was submitted without a registered pk (C11).
     SignedWithoutPk,
-    /// `set_init_seed_hash` reset an existing seed without a registered pk (C12).
-    SeedResetWithoutPk,
-    /// `Poseidon2(session_key, expiry) != old_pk_hash` (C13).
-    SessionAuthMismatch,
-    /// `session_expiry < max_block_timestamp` (C14).
-    SessionExpired,
+    /// A `set_init_seed_hash` referenced a user leaf (`user_id != 0`). The op is
+    /// operator-only and confined to the crash house account (leaf 0); a user
+    /// account's seed is installed once by the first `key_register` and rotates
+    /// only via `in_house_bet`.
+    SetInitSeedNotAccountZero,
+    /// An `in_house_bet` referenced the crash house account (`user_id == 0`)
+    /// (F8). An IHB rotates the bettor's seed, which on leaf 0 would re-commit
+    /// the crash seed outside the `set_init_seed_hash` path the block-level
+    /// settle invariant tracks. Leaf 0 never bets.
+    InHouseBetOnAccountZero,
     /// `Poseidon2(server_seed)[0..3] != old_seed_hash` (C9, in_house_bet).
     SeedChainBreak,
+    /// A slot that (re)commits a seed (`in_house_bet`, `set_init_seed_hash`, or
+    /// the first `key_register`) supplied an all-zero `next_server_seed_hash`.
+    /// Zero has no known preimage, so it would freeze the account's game lane
+    /// (or the crash house account) forever (mirror of `slot/fairness.rs`).
+    ZeroSeedCommit,
     /// `user_seed != Poseidon2(game_id, bet, prediction_hash, user_secret)`
     /// (C10, in_house_bet).
     UserSeedBindingMismatch,
     /// `Poseidon2(user_address) != old_address_hash` on redeposit (C15).
     AddressHashMismatch,
+    /// F6: `recipient_addr_hash` (the signed payout counterparty) does not
+    /// equal `Poseidon2(user_address)[0..2]` on a withdrawal, or is non-zero on
+    /// a slot that pays no one.
+    RecipientAddrHashMismatch,
     /// A `risk_reject` would drop the balance below `old_deposit_credit` (C4).
     RiskRejectBelowCredit,
     /// `win_amount != compute_payout(...)` or the `prediction_hash` does not
@@ -206,6 +295,21 @@ pub enum SlotRejection {
     /// revealed seed does not match the house-account (leaf 0) commitment fixed
     /// at round start (native mirror of the circuit's reveal→commit check).
     CrashSeedCommitMismatch,
+    /// The nonce lane this tx type bumps is already at its ceiling
+    /// (`GAME_LANE_MAX` / `ACCOUNT_LANE_MAX`), or the packed leaf nonce is
+    /// outside the 63-bit two-lane range. The circuit rejects instead of
+    /// carrying into the other lane or wrapping (mirror of `slot/nonce.rs`).
+    NonceLaneOverflow,
+    /// A provider `bet` exceeds the account's provider allowance
+    /// (`amount > old_provider_allowance`). The circuit's 62-bit check on
+    /// `old − amount` fails for it (mirror of `slot/allowance.rs`). An account
+    /// that never granted an allowance (or has no Schnorr key to sign one)
+    /// rejects every non-zero provider bet here — by design.
+    ProviderAllowanceExceeded,
+    /// A `set_provider_allowance` amount, or a stored `old_provider_allowance`,
+    /// is `>= 2^62` and cannot be packed into the leaf's two 31-bit halves
+    /// (the circuit's `split_allowance` range check).
+    ProviderAllowanceOverflow,
 }
 
 impl core::fmt::Display for SlotRejection {
@@ -222,9 +326,11 @@ impl std::error::Error for SlotRejection {}
 ///
 /// This pass implements the always-on layer that runs for EVERY tx type
 /// (mirroring the circuit's unconditional `build_slot_constraints`):
-///   * C1  — `tx_type` is in `0..=12`.
+///   * C1  — `tx_type` is in `0..=13`.
 ///   * C2b — every opaque field limb is canonical (`< p`).
 ///   * C2c — the full `amount` / `win_amount` are canonical (`< p`).
+///   * the stored provider allowance is `< 2^62` (the packed old-leaf fields
+///     `unpack_limb_field` splits are `< 2^63`).
 ///   * C17 — `user_id < 2^TREE_DEPTH`.
 ///   * C16 — the old leaf authenticates against `current_root` (truncated
 ///     `balance_hash[0..4] || pk_hash[0..2] || address_hash[0..2]` layout).
@@ -235,17 +341,19 @@ impl std::error::Error for SlotRejection {}
 /// are `< 2^32` and any `u8` is `< 2^8`, so no runtime comparison can fail.
 ///
 /// On top of the always-on layer, [`compute_effects`] applies the per-type
-/// balance `+/-` and credit cap ([`balance`], C6), the risk_reject floor (C4),
-/// the address/pk setter and redeposit check ([`address`], C15), session auth
-/// ([`auth`], C11/C12/C13/C14), and — for `in_house_bet` / `crash_settle` —
-/// the fairness layer ([`fairness`], C9 seed-chain, C10 user_seed binding,
-/// random derivation, payout defense-in-depth via `rolly-game-core`, and the
-/// `slot_h` multiset commitment). Then packs the new root / TL.
+/// balance `+/-` and credit cap ([`balance`], C6), the provider-allowance
+/// set / decrement ([`allowance`]), the risk_reject floor (C4), the address/pk
+/// setter and redeposit check ([`address`], C15), auth-set prerequisite
+/// ([`auth`], C11), and — for `in_house_bet` / `crash_settle` — the fairness
+/// layer ([`fairness`], C9 seed-chain, C10 user_seed binding, random
+/// derivation, payout defense-in-depth via `rolly-game-core`, and the `slot_h`
+/// multiset commitment). Then packs the new root / TL.
 pub fn validate_slot(input: &SlotInput) -> Result<SlotEffects, SlotRejection> {
     // ── Always-on input validation ──
     check_tx_type(input)?; // C1
     check_field_canonicity(input)?; // C2b
     check_amount_canonicity(input)?; // C2c
+    check_stored_allowance_range(input)?;
     check_user_id_range(input)?; // C17
 
     // ── Always-on state consistency ──
@@ -258,10 +366,21 @@ pub fn validate_slot(input: &SlotInput) -> Result<SlotEffects, SlotRejection> {
     compute_effects(input)
 }
 
-/// C1: `tx_type` must decode to exactly one of the 13 one-hot flags.
+/// C1: `tx_type` must decode to exactly one of the 14 one-hot flags.
 fn check_tx_type(input: &SlotInput) -> Result<(), SlotRejection> {
     if input.tx_type > MAX_TX_TYPE {
         return Err(SlotRejection::BadTxType);
+    }
+    Ok(())
+}
+
+/// The stored provider allowance must fit its two 31-bit leaf halves. A value
+/// `>= 2^62` has no packed representation (`unpack_limb_field` in the circuit
+/// would not admit the field), so it can never have come from a proven leaf;
+/// reject it before the old-leaf hash would try to pack it.
+fn check_stored_allowance_range(input: &SlotInput) -> Result<(), SlotRejection> {
+    if input.old_provider_allowance > field::PROVIDER_ALLOWANCE_MAX {
+        return Err(SlotRejection::ProviderAllowanceOverflow);
     }
     Ok(())
 }
@@ -275,8 +394,7 @@ fn check_field_canonicity(input: &SlotInput) -> Result<(), SlotRejection> {
         && field::all_canonical(&input.user_seed)
         && field::all_canonical(&input.old_seed_hash)
         && field::all_canonical(&input.next_server_seed_hash)
-        && field::all_canonical(&input.session_key)
-        && field::is_canonical(input.session_expiry)
+        && field::is_canonical(input.old_nonce)
         && field::all_canonical(&input.old_pk_hash)
         && field::all_canonical(&input.new_pk_hash)
         && field::all_canonical(&input.old_address_hash)
@@ -315,11 +433,17 @@ fn check_user_id_range(input: &SlotInput) -> Result<(), SlotRejection> {
 /// key state-consistency check — proves the witness reflects the live tree.
 ///
 /// Relies on C2b having already validated `old_seed_hash`, `old_pk_hash`,
-/// `old_address_hash` and `main_siblings`, so the Poseidon2 calls cannot be fed
-/// a non-canonical element.
+/// `old_address_hash` and `main_siblings` (and the allowance range check), so
+/// the Poseidon2 calls cannot be fed a non-canonical element.
 fn verify_current_root(input: &SlotInput) -> Result<(), SlotRejection> {
     let old_balance_hash =
-        hash::balance_leaf(input.old_balance, input.old_seed_hash, input.old_deposit_credit);
+        hash::balance_leaf(
+            input.old_balance,
+            input.old_seed_hash,
+            input.old_deposit_credit,
+            input.old_nonce,
+            input.old_provider_allowance,
+        );
     let computed = merkle::compute_root(
         old_balance_hash,
         input.old_pk_hash,
@@ -351,40 +475,103 @@ pub(crate) fn compute_new_tl(
         .ok_or(SlotRejection::TlOverflow)
 }
 
+/// Two-lane nonce advance for a slot of `tx_type` (see [`compute_new_nonce`]).
+/// `is_key_setter` is `key_register_only && new_pk_hash != 0`. Public so the
+/// witness engine's batch-delta mirror advances the nonce with this exact rule
+/// instead of copying the arithmetic. Does NOT check the registered-pk
+/// prerequisite — that is [`validate_slot`]'s job at accept time.
+pub fn advance_nonce(old_nonce: u64, tx_type: u8, is_key_setter: bool) -> Result<u64, SlotRejection> {
+    let flags = flags::TxFlags::from_tx_type(tx_type);
+    let is_game_bump = flags.is_game_lane();
+    let is_account_bump = flags.is_withdrawal || flags.is_transfer || is_key_setter;
+    compute_new_nonce(old_nonce, is_game_bump, is_account_bump)
+}
+
+/// Two-lane nonce advance, the native mirror of `slot/nonce.rs`:
+///   * `is_game_bump`    (`in_house_bet | crash_settle | set_provider_allowance`) → `+1`;
+///   * `is_account_bump` (`withdrawal | transfer | is_key_setter`)               → `+2^40`;
+///   * neither leaves the packed value untouched.
+///
+/// The two bump sets are disjoint (one-hot tx flags) and together cover exactly
+/// `is_authenticated | is_key_setter`. A bump on a lane already at its ceiling
+/// — or a leaf nonce the circuit's 63-bit range check would not admit — is a
+/// typed rejection, never a carry or a wrap. (The old `p−1 → 0` field wrap is
+/// unreachable: `account_lane < 2^23 ⇒ nonce < 2^63 < p`.)
+pub(crate) fn compute_new_nonce(
+    old_nonce: u64,
+    is_game_bump: bool,
+    is_account_bump: bool,
+) -> Result<u64, SlotRejection> {
+    if old_nonce >= (1u64 << (GAME_LANE_BITS + ACCOUNT_LANE_BITS)) {
+        return Err(SlotRejection::NonceLaneOverflow);
+    }
+    let (account_lane, game_lane) = split_nonce(old_nonce);
+
+    if is_game_bump && game_lane == GAME_LANE_MAX {
+        return Err(SlotRejection::NonceLaneOverflow);
+    }
+    if is_account_bump && account_lane == ACCOUNT_LANE_MAX {
+        return Err(SlotRejection::NonceLaneOverflow);
+    }
+    Ok(old_nonce + is_game_bump as u64 + is_account_bump as u64 * ACCOUNT_LANE_UNIT)
+}
+
 /// Derive `new_root` from the post-tx user state, reusing the identical
 /// truncated leaf layout as C16 (`balance_hash[0..4] || pk_hash[0..2] ||
 /// address_hash[0..2]`). The per-type effect layer feeds the new balance /
-/// credit / seed / pk / address it computes; here we just hash + lift.
+/// credit / seed / nonce / allowance / pk / address it computes; here we just
+/// hash + lift.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_new_root(
     new_balance: u64,
     new_seed_hash: [u64; 3],
     new_credit: u64,
+    new_nonce: u64,
+    new_allowance: u64,
     new_pk_hash: [u64; 4],
     new_address_hash: [u64; 4],
     siblings: &[[u64; 4]; TREE_DEPTH],
     user_id: u32,
 ) -> [u64; 4] {
-    let new_balance_hash = hash::balance_leaf(new_balance, new_seed_hash, new_credit);
+    let new_balance_hash =
+        hash::balance_leaf(new_balance, new_seed_hash, new_credit, new_nonce, new_allowance);
     merkle::compute_root(new_balance_hash, new_pk_hash, new_address_hash, siblings, user_id)
 }
 
 /// Per-type effect computation, mirroring the flag-driven data flow of
 /// `build_slot_constraints` (it does NOT branch per type — flags select).
 ///
-/// The order matches the circuit: balance/credit → risk_reject floor →
-/// address/pk → seed-reset signal → session auth → seed advance → new root / TL.
-/// Every fully-specified type (`noop`, `deposit`, `bet`, `win`, `bonus`,
-/// `withdrawal`, `risk_reject`, `set_init_seed_hash`, `key_register_only`,
-/// `transfer`, `referral`) is completed here. `in_house_bet` / `crash_settle`
-/// run their balance and auth here, then defer the fairness/payout assembly
-/// (`random`, `slot_h`, multiset membership, C9/C10/PayoutMismatch) to the
-/// fairness-payout to-do.
+/// The order matches the circuit: balance/credit → provider allowance →
+/// risk_reject floor → address/pk → auth-set decode → nonce/seed advance →
+/// new root / TL. Every fully-specified type (`noop`, `deposit`, `bet`, `win`,
+/// `bonus`, `withdrawal`, `risk_reject`, `set_init_seed_hash`,
+/// `key_register_only`, `transfer`, `referral`, `set_provider_allowance`) is
+/// completed here. `in_house_bet` / `crash_settle` run their balance and auth
+/// here, then defer the fairness/payout assembly (`random`, `slot_h`, multiset
+/// membership, C9/C10/PayoutMismatch) to the fairness-payout to-do.
 fn compute_effects(input: &SlotInput) -> Result<SlotEffects, SlotRejection> {
     let flags = flags::TxFlags::from_tx_type(input.tx_type);
+
+    // set_init_seed_hash is operator-only on the crash house account (leaf 0).
+    // Mirrors the circuit constraint `is_set_init_seed_hash → user_id == 0`.
+    if flags.is_set_init_seed_hash && input.user_id != 0 {
+        return Err(SlotRejection::SetInitSeedNotAccountZero);
+    }
+
+    // The crash house account (leaf 0) never places an in_house_bet (F8).
+    // Mirrors the circuit constraint `is_in_house_bet AND user_id == 0 → 0`.
+    if flags.is_in_house_bet && input.user_id == 0 {
+        return Err(SlotRejection::InHouseBetOnAccountZero);
+    }
 
     // Balance / credit transition (mirror balance.rs): includes C6 (underflow)
     // and the deposit-credit cap to `min(credit, new_balance)`.
     let bal = balance::build_balance_changes(input, &flags)?;
+
+    // Provider allowance (mirror allowance.rs): `set_provider_allowance`
+    // installs `amount`, a provider `bet` must fit in and decrements it,
+    // everything else carries it forward.
+    let new_provider_allowance = allowance::compute_new_allowance(input, &flags)?;
 
     // C4: a risk_reject (operator revert) must not push the balance below the
     // user's deposited credit. Mirrors the conditional `sub_u64` in slot/mod.rs.
@@ -396,14 +583,18 @@ fn compute_effects(input: &SlotInput) -> Result<SlotEffects, SlotRejection> {
     // C15. Yields `is_key_setter`, which the auth signed-set decode needs.
     let addr = address::build_address(input, &flags)?;
 
-    // is_seed_reset: `set_init_seed_hash` overwriting a live (non-zero) seed.
-    // This is the single fairness-layer signal the auth set consumes; the rest
-    // of fairness (seed-chain C9, user_seed binding C10, `random`) is the
-    // fairness-payout to-do.
-    let is_seed_reset = flags.is_set_init_seed_hash && !field::all_zero(&input.old_seed_hash);
+    // F6: the signed payout counterparty must be the address the slot pays.
+    address::check_recipient_binding(input, &flags)?;
 
-    // Session auth (mirror auth.rs + session.rs): C11 / C12 / C13 / C14.
-    auth::check_auth(input, &flags, addr.is_key_setter, is_seed_reset)?;
+    // The side-circuit verifies Schnorr signatures; locally we enforce that
+    // every authenticated type has a registered key and decode which nonce
+    // lane it signed. Same predicates as the circuit: `is_game_bump =
+    // is_ihb | is_crash | is_set_provider_allowance`, `is_acct_bump =
+    // is_acct_lane | is_key_setter`.
+    let auth = auth::check_auth(input, &flags)?;
+    let is_account_bump = auth.is_account_lane || addr.is_key_setter;
+    let new_nonce = compute_new_nonce(input.old_nonce, auth.is_game_lane, is_account_bump)?;
+    let (new_account_nonce, new_game_nonce) = split_nonce(new_nonce);
 
     // Fairness + payout layer for in_house_bet / crash_settle: C9 seed-chain,
     // C10 user_seed binding (IHB only), random derivation, payout verification
@@ -414,12 +605,22 @@ fn compute_effects(input: &SlotInput) -> Result<SlotEffects, SlotRejection> {
         None
     };
 
-    // Seed advance: IHB and set_init_seed_hash install `next_server_seed_hash`;
-    // crash_settle and everything else keep the old seed. When IHB produced
-    // a FairnessEffects, its `new_seed_hash` is already `next_server_seed_hash`.
+    // Seed advance (mirror fairness.rs): in_house_bet rotates the seed (via its
+    // FairnessEffects.new_seed_hash), set_init_seed_hash re-commits the crash
+    // house seed (operator, leaf 0), and the FIRST key_register installs the
+    // account's initial seed. A key rotation (old_seed_hash != 0) and every
+    // other tx keep the old seed. crash_settle keeps the old seed too (its
+    // FairnessEffects.new_seed_hash == old_seed_hash).
+    let is_first_registration =
+        flags.is_key_register_only && field::all_zero(&input.old_seed_hash);
+    let is_needs_new_seed =
+        flags.is_in_house_bet || flags.is_set_init_seed_hash || is_first_registration;
+    if is_needs_new_seed && field::all_zero(&input.next_server_seed_hash) {
+        return Err(SlotRejection::ZeroSeedCommit);
+    }
     let new_seed_hash = if let Some(ref fe) = fairness_result {
         fe.new_seed_hash
-    } else if flags.is_set_init_seed_hash {
+    } else if flags.is_set_init_seed_hash || is_first_registration {
         input.next_server_seed_hash
     } else {
         input.old_seed_hash
@@ -431,6 +632,8 @@ fn compute_effects(input: &SlotInput) -> Result<SlotEffects, SlotRejection> {
         bal.new_balance,
         new_seed_hash,
         bal.new_credit,
+        new_nonce,
+        new_provider_allowance,
         addr.new_pk_hash,
         addr.new_address_hash,
         &input.main_siblings,
@@ -441,6 +644,10 @@ fn compute_effects(input: &SlotInput) -> Result<SlotEffects, SlotRejection> {
         new_balance: bal.new_balance,
         new_credit: bal.new_credit,
         new_seed_hash,
+        new_nonce,
+        new_game_nonce,
+        new_account_nonce,
+        new_provider_allowance,
         new_pk_hash: addr.new_pk_hash,
         new_address_hash: addr.new_address_hash,
         new_root,
@@ -461,13 +668,15 @@ mod tests {
         let user_id = 0b1011u32;
         let old_balance = 1_500_000u64;
         let old_credit = 1_000_000u64;
+        let old_nonce = 17u64;
         let old_seed_hash = [11u64, 22, 33];
         let old_pk_hash = [101u64, 102, 103, 104];
         let old_address_hash = [201u64, 202, 203, 204];
         let main_siblings: [[u64; 4]; TREE_DEPTH] =
             core::array::from_fn(|l| core::array::from_fn(|j| (l as u64) * 7 + j as u64 + 1));
 
-        let old_balance_hash = hash::balance_leaf(old_balance, old_seed_hash, old_credit);
+        let old_balance_hash =
+            hash::balance_leaf(old_balance, old_seed_hash, old_credit, old_nonce, 0);
         let current_root = merkle::compute_root(
             old_balance_hash,
             old_pk_hash,
@@ -483,27 +692,28 @@ mod tests {
             win_amount: 0,
             old_balance,
             old_deposit_credit: old_credit,
+            old_nonce,
+            old_provider_allowance: 0,
             main_siblings,
             server_seed: [0; 8],
             user_seed: [0; 4],
             old_seed_hash,
             next_server_seed_hash: [0; 3],
-            session_key: [0; 4],
-            session_expiry: 0,
             old_pk_hash,
             new_pk_hash: [0; 4],
             user_address: [0; 20],
             old_address_hash,
+            recipient_addr_hash: [0; 2],
             old_total_liability: 4_000_000,
             game_id: 0,
             prediction_hash: [0; 4],
             user_secret_random: [0; 4],
             current_root,
             current_tl: 4_000_000,
-            max_block_timestamp: 0,
             game_mode: 0,
             prediction_lo: 0,
             prediction_hi: 0,
+            base_bet: 0,
             keno_selected: Vec::new(),
             crash_seed_hash: None,
         }
@@ -516,11 +726,23 @@ mod tests {
         assert_eq!(eff.new_balance, inp.old_balance);
         assert_eq!(eff.new_credit, inp.old_deposit_credit);
         assert_eq!(eff.new_seed_hash, inp.old_seed_hash);
+        assert_eq!(eff.new_nonce, inp.old_nonce);
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (0, inp.old_nonce));
+        assert_eq!(eff.new_provider_allowance, 0);
         assert_eq!(eff.new_pk_hash, inp.old_pk_hash);
         assert_eq!(eff.new_address_hash, inp.old_address_hash);
         assert_eq!(eff.new_root, inp.current_root);
         assert_eq!(eff.new_total_liability, inp.current_tl);
         assert!(!eff.is_multiset_slot);
+    }
+
+    #[test]
+    fn stored_allowance_above_62_bits_is_rejected_before_hashing() {
+        // A leaf can never hold such a value; the always-on layer catches it
+        // ahead of the old-leaf hash (which would otherwise panic on packing).
+        let mut inp = consistent_noop();
+        inp.old_provider_allowance = 1u64 << 62;
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::ProviderAllowanceOverflow));
     }
 
     #[test]
@@ -538,7 +760,7 @@ mod tests {
         assert_eq!(validate_slot(&inp), Err(SlotRejection::FieldNotCanonical));
 
         let mut inp = consistent_noop();
-        inp.session_expiry = field::GOLDILOCKS_P;
+        inp.old_nonce = field::GOLDILOCKS_P;
         assert_eq!(validate_slot(&inp), Err(SlotRejection::FieldNotCanonical));
 
         let mut inp = consistent_noop();
@@ -605,22 +827,111 @@ mod tests {
         assert_eq!(compute_new_tl(10, 0, 11), Err(SlotRejection::TlOverflow));
     }
 
+    // ── Two-lane nonce arithmetic (pure, no tree) ──
+
+    #[test]
+    fn split_and_join_nonce_round_trip() {
+        assert_eq!(split_nonce(0), (0, 0));
+        assert_eq!(split_nonce(41), (0, 41)); // legacy single-lane nonce
+        assert_eq!(split_nonce(ACCOUNT_LANE_UNIT), (1, 0));
+        assert_eq!(split_nonce(ACCOUNT_LANE_UNIT - 1), (0, GAME_LANE_MAX));
+        let top = join_nonce(ACCOUNT_LANE_MAX, GAME_LANE_MAX);
+        assert_eq!(top, (1u64 << 63) - 1);
+        assert!(field::is_canonical(top), "a full two-lane nonce stays below p");
+        for (a, g) in [(0, 0), (1, 0), (0, 1), (7, 123_456_789), (ACCOUNT_LANE_MAX, GAME_LANE_MAX)] {
+            assert_eq!(split_nonce(join_nonce(a, g)), (a, g));
+        }
+    }
+
+    #[test]
+    fn compute_new_nonce_bumps_each_lane_in_isolation() {
+        let n = join_nonce(5, 900);
+        assert_eq!(compute_new_nonce(n, false, false), Ok(n));
+        assert_eq!(compute_new_nonce(n, true, false), Ok(join_nonce(5, 901)));
+        assert_eq!(compute_new_nonce(n, false, true), Ok(join_nonce(6, 900)));
+        // Legacy nonce: the first account-lane bump lands in bits 40.., the
+        // game lane is untouched.
+        assert_eq!(compute_new_nonce(41, false, true), Ok(join_nonce(1, 41)));
+        assert_eq!(compute_new_nonce(41, true, false), Ok(42));
+    }
+
+    #[test]
+    fn compute_new_nonce_rejects_at_lane_ceiling_without_carry() {
+        let game_full = join_nonce(2, GAME_LANE_MAX);
+        assert_eq!(
+            compute_new_nonce(game_full, true, false),
+            Err(SlotRejection::NonceLaneOverflow)
+        );
+        // The other lane is still free to move.
+        assert_eq!(
+            compute_new_nonce(game_full, false, true),
+            Ok(join_nonce(3, GAME_LANE_MAX))
+        );
+
+        let acct_full = join_nonce(ACCOUNT_LANE_MAX, 10);
+        assert_eq!(
+            compute_new_nonce(acct_full, false, true),
+            Err(SlotRejection::NonceLaneOverflow)
+        );
+        assert_eq!(
+            compute_new_nonce(acct_full, true, false),
+            Ok(join_nonce(ACCOUNT_LANE_MAX, 11))
+        );
+
+        // Both lanes saturated: storable, but neither may bump.
+        let both_full = join_nonce(ACCOUNT_LANE_MAX, GAME_LANE_MAX);
+        assert_eq!(compute_new_nonce(both_full, false, false), Ok(both_full));
+        assert_eq!(compute_new_nonce(both_full, true, false), Err(SlotRejection::NonceLaneOverflow));
+        assert_eq!(compute_new_nonce(both_full, false, true), Err(SlotRejection::NonceLaneOverflow));
+
+        // Outside the 63-bit two-lane range (still < p): the circuit's
+        // `split_le(_, 63)` would not admit it, so neither do we — even unbumped.
+        for bad in [1u64 << 63, field::GOLDILOCKS_P - 1] {
+            assert_eq!(compute_new_nonce(bad, false, false), Err(SlotRejection::NonceLaneOverflow));
+            assert_eq!(compute_new_nonce(bad, true, false), Err(SlotRejection::NonceLaneOverflow));
+        }
+    }
+
+    #[test]
+    fn advance_nonce_dispatches_lane_by_tx_type() {
+        let n = join_nonce(3, 77);
+        for tx_type in [TX_IN_HOUSE_BET, TX_CRASH_SETTLE, TX_SET_PROVIDER_ALLOWANCE] {
+            assert_eq!(advance_nonce(n, tx_type, false), Ok(join_nonce(3, 78)), "tx_type {tx_type}");
+        }
+        for tx_type in [TX_WITHDRAWAL, TX_TRANSFER] {
+            assert_eq!(advance_nonce(n, tx_type, false), Ok(join_nonce(4, 77)), "tx_type {tx_type}");
+        }
+        // key_register bumps the account lane only when it actually sets a key.
+        assert_eq!(advance_nonce(n, TX_KEY_REGISTER_ONLY, true), Ok(join_nonce(4, 77)));
+        assert_eq!(advance_nonce(n, TX_KEY_REGISTER_ONLY, false), Ok(n));
+        for tx_type in [
+            TX_NOOP, TX_DEPOSIT, TX_BET, TX_WIN, TX_BONUS, TX_RISK_REJECT,
+            TX_SET_INIT_SEED_HASH, TX_REFERRAL,
+        ] {
+            assert_eq!(advance_nonce(n, tx_type, false), Ok(n), "tx_type {tx_type}");
+        }
+    }
+
     // ── End-to-end per-type effects through `validate_slot` ──
     //
     // These drive the full always-on + per-type pipeline (and independently
     // re-derive the post-tx root) so the layers are checked composed, not just
     // in their module unit tests.
 
-    const SESSION_KEY: [u64; 4] = [1111, 2222, 3333, 4444];
-    const SESSION_EXPIRY: u64 = 2_000_000_000;
-    const MAX_BLOCK_TS: u64 = 1_900_000_000;
+    const SCHNORR_PK: [u64; 5] = [1111, 2222, 3333, 4444, 5555];
     const NEW_PK: [u64; 4] = [9001, 9002, 9003, 9004];
 
     /// Recompute `current_root` / `current_tl` from the old state so the
     /// always-on consistency layer passes and only the per-type effects are
     /// exercised.
     fn commit(mut inp: SlotInput) -> SlotInput {
-        let bh = hash::balance_leaf(inp.old_balance, inp.old_seed_hash, inp.old_deposit_credit);
+        let bh = hash::balance_leaf(
+            inp.old_balance,
+            inp.old_seed_hash,
+            inp.old_deposit_credit,
+            inp.old_nonce,
+            inp.old_provider_allowance,
+        );
         inp.current_root = merkle::compute_root(
             bh,
             inp.old_pk_hash,
@@ -632,8 +943,8 @@ mod tests {
         inp
     }
 
-    /// A registered, addressed, seeded user with a live session, committed into
-    /// the tree. Address bytes `[7; 20]` hash to `old_address_hash`.
+    /// A registered, addressed, seeded user committed into the tree. Address
+    /// bytes `[7; 20]` hash to `old_address_hash`.
     fn registered_user(tx_type: u8) -> SlotInput {
         let main_siblings: [[u64; 4]; TREE_DEPTH] =
             core::array::from_fn(|l| core::array::from_fn(|j| (l as u64) * 5 + j as u64 + 3));
@@ -642,23 +953,28 @@ mod tests {
             user_id: 0b110101u32,
             old_balance: 2_000_000,
             old_deposit_credit: 1_200_000,
+            old_nonce: 41,
             main_siblings,
             old_seed_hash: [71, 82, 93],
-            session_key: SESSION_KEY,
-            session_expiry: SESSION_EXPIRY,
-            old_pk_hash: hash::session_pk_hash(SESSION_KEY, SESSION_EXPIRY),
+            old_pk_hash: hash::schnorr_pk_hash(SCHNORR_PK),
             old_address_hash: hash::address_hash([7u8; 20]),
             old_total_liability: 9_000_000,
-            max_block_timestamp: MAX_BLOCK_TS,
             ..SlotInput::default()
         })
     }
 
     /// Independently rebuild the post-tx root from the returned effects. Equal
-    /// to `eff.new_root` only if the right (balance, seed, credit, pk, address)
-    /// were fed into the leaf — guards against argument-order regressions.
+    /// to `eff.new_root` only if the right (balance, seed, credit, nonce,
+    /// allowance, pk, address) were fed into the leaf — guards against
+    /// argument-order regressions.
     fn root_of_effects(inp: &SlotInput, eff: &SlotEffects) -> [u64; 4] {
-        let bh = hash::balance_leaf(eff.new_balance, eff.new_seed_hash, eff.new_credit);
+        let bh = hash::balance_leaf(
+            eff.new_balance,
+            eff.new_seed_hash,
+            eff.new_credit,
+            eff.new_nonce,
+            eff.new_provider_allowance,
+        );
         merkle::compute_root(
             bh,
             eff.new_pk_hash,
@@ -706,42 +1022,159 @@ mod tests {
     }
 
     #[test]
-    fn signed_bet_caps_credit_and_debits_tl() {
+    fn provider_bet_caps_credit_without_nonce_bump() {
         let mut inp = registered_user(TX_BET);
+        inp.old_provider_allowance = 1_500_000; // the owner granted providers 1.5M
         inp.amount = 1_000_000; // new_balance 1_000_000 < credit 1_200_000
         let inp = commit(inp);
-        let eff = validate_slot(&inp).expect("signed bet must validate");
+        let eff = validate_slot(&inp).expect("provider bet must validate");
         assert_eq!(eff.new_balance, 1_000_000);
         assert_eq!(eff.new_credit, 1_000_000); // capped to new balance
         assert_eq!(eff.new_total_liability, 8_000_000); // TL -= amount
+        assert_eq!(eff.new_nonce, inp.old_nonce);
+        assert_eq!(eff.new_provider_allowance, 500_000); // allowance -= amount
         assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
     }
 
     #[test]
-    fn bet_without_registered_pk_is_rejected() {
+    fn provider_bet_without_registered_pk_is_allowed_within_allowance() {
+        // The bet itself needs no Schnorr key — only the allowance that caps it
+        // was signed (an account with no key can never have set one, so in
+        // practice its allowance is 0 and every non-zero provider bet rejects).
         let mut inp = registered_user(TX_BET);
         inp.old_pk_hash = [0; 4];
+        inp.old_provider_allowance = 100_000;
         inp.amount = 100_000;
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("provider bet does not require a Schnorr key");
+        assert_eq!(eff.new_nonce, inp.old_nonce);
+        assert_eq!(eff.new_provider_allowance, 0);
+    }
+
+    #[test]
+    fn provider_bet_above_allowance_is_rejected() {
+        // Balance would cover it (2M), but the owner only allowed 100k.
+        let mut inp = registered_user(TX_BET);
+        inp.old_provider_allowance = 100_000;
+        inp.amount = 100_001;
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::ProviderAllowanceExceeded));
+
+        // No allowance ever granted (every legacy leaf): non-zero bets reject.
+        let mut inp = registered_user(TX_BET);
+        inp.amount = 1;
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::ProviderAllowanceExceeded));
+
+        // The allowance check is independent of C6: an over-balance bet within
+        // the allowance still fails on the balance.
+        let mut inp = registered_user(TX_BET);
+        inp.old_provider_allowance = PROVIDER_ALLOWANCE_MAX_FOR_TEST;
+        inp.amount = 2_000_001;
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::InsufficientBalance));
+    }
+
+    const PROVIDER_ALLOWANCE_MAX_FOR_TEST: u64 = field::PROVIDER_ALLOWANCE_MAX;
+
+    #[test]
+    fn set_provider_allowance_is_signed_absolute_and_bumps_game_lane() {
+        let mut inp = registered_user(TX_SET_PROVIDER_ALLOWANCE);
+        inp.old_provider_allowance = 5;
+        inp.amount = 7_500_000; // the new absolute allowance (may exceed balance)
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("set_provider_allowance must validate");
+        assert_eq!(eff.new_provider_allowance, 7_500_000, "absolute, not additive");
+        // Balance / credit / seed / TL untouched.
+        assert_eq!(eff.new_balance, inp.old_balance);
+        assert_eq!(eff.new_credit, inp.old_deposit_credit);
+        assert_eq!(eff.new_seed_hash, inp.old_seed_hash);
+        assert_eq!(eff.new_total_liability, inp.old_total_liability);
+        // Game-lane bump (like a bet), account lane untouched.
+        assert_eq!(eff.new_nonce, inp.old_nonce + 1);
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (0, 42));
+        assert!(!eff.is_multiset_slot);
+        assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
+        // The allowance actually lands in the leaf: a root built with 0 differs.
+        let bh0 = hash::balance_leaf(eff.new_balance, eff.new_seed_hash, eff.new_credit, eff.new_nonce, 0);
+        let root0 = merkle::compute_root(bh0, eff.new_pk_hash, eff.new_address_hash, &inp.main_siblings, inp.user_id);
+        assert_ne!(eff.new_root, root0);
+
+        // Revoke: amount = 0.
+        let mut revoke = registered_user(TX_SET_PROVIDER_ALLOWANCE);
+        revoke.old_provider_allowance = 7_500_000;
+        revoke.amount = 0;
+        let revoke = commit(revoke);
+        let eff = validate_slot(&revoke).expect("revoke must validate");
+        assert_eq!(eff.new_provider_allowance, 0);
+        assert_eq!(eff.new_root, root_of_effects(&revoke, &eff));
+    }
+
+    #[test]
+    fn set_provider_allowance_requires_registered_pk() {
+        let mut inp = registered_user(TX_SET_PROVIDER_ALLOWANCE);
+        inp.old_pk_hash = [0; 4];
+        inp.amount = 1;
         let inp = commit(inp);
         assert_eq!(validate_slot(&inp), Err(SlotRejection::SignedWithoutPk));
     }
 
     #[test]
-    fn bet_with_expired_session_is_rejected() {
-        let mut inp = registered_user(TX_BET);
-        inp.amount = 100_000;
-        inp.max_block_timestamp = SESSION_EXPIRY + 1; // session no longer live
+    fn set_provider_allowance_above_62_bits_is_rejected() {
+        let mut inp = registered_user(TX_SET_PROVIDER_ALLOWANCE);
+        inp.amount = 1u64 << 62;
         let inp = commit(inp);
-        assert_eq!(validate_slot(&inp), Err(SlotRejection::SessionExpired));
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::ProviderAllowanceOverflow));
+
+        let mut inp = registered_user(TX_SET_PROVIDER_ALLOWANCE);
+        inp.amount = PROVIDER_ALLOWANCE_MAX_FOR_TEST;
+        let inp = commit(inp);
+        assert_eq!(
+            validate_slot(&inp).map(|e| e.new_provider_allowance),
+            Ok(PROVIDER_ALLOWANCE_MAX_FOR_TEST),
+        );
     }
 
     #[test]
-    fn bet_with_wrong_session_key_is_rejected() {
-        let mut inp = registered_user(TX_BET);
-        inp.amount = 100_000;
-        inp.session_key[0] ^= 1; // no longer reproduces old_pk_hash
+    fn set_provider_allowance_rejects_recipient_and_game_lane_ceiling() {
+        // F6: no payout counterparty on a set_provider_allowance.
+        let mut inp = registered_user(TX_SET_PROVIDER_ALLOWANCE);
+        inp.amount = 10;
+        inp.recipient_addr_hash = [1, 2];
         let inp = commit(inp);
-        assert_eq!(validate_slot(&inp), Err(SlotRejection::SessionAuthMismatch));
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::RecipientAddrHashMismatch));
+
+        // Game lane saturated: reject, do not carry.
+        let mut inp = registered_user(TX_SET_PROVIDER_ALLOWANCE);
+        inp.old_nonce = join_nonce(2, GAME_LANE_MAX);
+        inp.amount = 10;
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::NonceLaneOverflow));
+    }
+
+    #[test]
+    fn win_and_other_types_keep_the_allowance_strict() {
+        // `win` after a provider bet does NOT restore the allowance.
+        let mut inp = registered_user(TX_WIN);
+        inp.old_pk_hash = [0; 4];
+        inp.old_provider_allowance = 400_000;
+        inp.amount = 333_333;
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("win must validate");
+        assert_eq!(eff.new_provider_allowance, 400_000);
+        assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
+
+        for tx in [TX_DEPOSIT, TX_WITHDRAWAL, TX_TRANSFER, TX_BONUS] {
+            let mut inp = registered_user(tx);
+            inp.old_provider_allowance = 400_000;
+            inp.amount = 1_000;
+            inp.user_address = [7u8; 20];
+            inp.recipient_addr_hash = recipient_addr_hash_for(tx, inp.user_address);
+            let inp = commit(inp);
+            let eff = validate_slot(&inp).unwrap_or_else(|e| panic!("tx {tx}: {e}"));
+            assert_eq!(eff.new_provider_allowance, 400_000, "tx {tx} must keep the allowance");
+            assert_eq!(eff.new_root, root_of_effects(&inp, &eff), "tx {tx}");
+        }
     }
 
     #[test]
@@ -750,6 +1183,52 @@ mod tests {
         inp.amount = 2_000_001; // > old_balance
         let inp = commit(inp);
         assert_eq!(validate_slot(&inp), Err(SlotRejection::InsufficientBalance));
+    }
+
+    #[test]
+    fn withdrawal_pays_the_signed_counterparty_f6() {
+        // The hot wallet the user signed for (any address — not necessarily the
+        // account's registered one).
+        let hot_wallet = [0xABu8; 20];
+        let h = hash::address_hash(hot_wallet);
+
+        let mut inp = registered_user(TX_WITHDRAWAL);
+        inp.amount = 750_000;
+        inp.user_address = hot_wallet;
+        inp.recipient_addr_hash = [h[0], h[1]];
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("withdrawal to the signed counterparty must validate");
+        assert_eq!(eff.new_balance, 1_250_000);
+        assert_eq!(eff.new_nonce, join_nonce(1, 41)); // authenticated ⇒ account-lane bump
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (1, 41));
+        assert_eq!(eff.new_address_hash, inp.old_address_hash); // leaf address untouched
+        assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
+
+        // Same signed counterparty, but the slot pays a different address.
+        let mut redirected = inp.clone();
+        redirected.user_address = [0xCDu8; 20];
+        assert_eq!(
+            validate_slot(&redirected),
+            Err(SlotRejection::RecipientAddrHashMismatch)
+        );
+
+        // Slot pays the signed address, but the recipient field was zeroed
+        // (an unsigned destination).
+        let mut unsigned_dest = inp.clone();
+        unsigned_dest.recipient_addr_hash = [0; 2];
+        assert_eq!(
+            validate_slot(&unsigned_dest),
+            Err(SlotRejection::RecipientAddrHashMismatch)
+        );
+    }
+
+    #[test]
+    fn non_payout_slot_with_recipient_is_rejected_f6() {
+        let mut inp = registered_user(TX_TRANSFER);
+        inp.amount = 100_000;
+        inp.recipient_addr_hash = [11, 22];
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::RecipientAddrHashMismatch));
     }
 
     #[test]
@@ -786,7 +1265,9 @@ mod tests {
 
     #[test]
     fn set_init_seed_first_time_is_unsigned() {
+        // set_init_seed_hash is operator-only on the crash house account (leaf 0).
         let mut inp = registered_user(TX_SET_INIT_SEED_HASH);
+        inp.user_id = 0;
         inp.old_seed_hash = [0; 3]; // first initialization ⇒ no reset, no auth
         inp.old_pk_hash = [0; 4];
         inp.next_server_seed_hash = [501, 502, 503];
@@ -799,20 +1280,100 @@ mod tests {
     }
 
     #[test]
-    fn set_init_seed_reset_requires_session() {
-        // Resetting a live seed with a valid session advances it.
+    fn set_init_seed_reset_does_not_bump_nonce() {
+        // Operator re-commit of the crash house seed on leaf 0.
         let mut inp = registered_user(TX_SET_INIT_SEED_HASH);
+        inp.user_id = 0;
         inp.next_server_seed_hash = [601, 602, 603];
         let inp = commit(inp);
-        let eff = validate_slot(&inp).expect("authorized seed reset must validate");
+        let eff = validate_slot(&inp).expect("operator seed reset must validate");
         assert_eq!(eff.new_seed_hash, [601, 602, 603]);
+        assert_eq!(eff.new_nonce, inp.old_nonce);
 
-        // Same reset without a registered pk ⇒ C12.
+        // Seed reset is not a Schnorr-authenticated user operation.
         let mut no_pk = registered_user(TX_SET_INIT_SEED_HASH);
+        no_pk.user_id = 0;
         no_pk.old_pk_hash = [0; 4];
         no_pk.next_server_seed_hash = [601, 602, 603];
         let no_pk = commit(no_pk);
-        assert_eq!(validate_slot(&no_pk), Err(SlotRejection::SeedResetWithoutPk));
+        assert!(validate_slot(&no_pk).is_ok());
+    }
+
+    #[test]
+    fn set_init_seed_on_user_leaf_is_rejected() {
+        // A set_init_seed_hash on any non-zero leaf is operator-forbidden: a user
+        // account's seed is installed by its first key_register and rotates only
+        // via in_house_bet.
+        let mut inp = registered_user(TX_SET_INIT_SEED_HASH);
+        inp.user_id = 7; // not the crash house account
+        inp.next_server_seed_hash = [601, 602, 603];
+        let inp = commit(inp);
+        assert_eq!(
+            validate_slot(&inp),
+            Err(SlotRejection::SetInitSeedNotAccountZero),
+        );
+    }
+
+    #[test]
+    fn first_key_registration_installs_initial_seed() {
+        // The first key_register (old_seed_hash == 0) installs the account's
+        // initial seed from next_server_seed_hash; a later rotation leaves it.
+        let mut first = registered_user(TX_KEY_REGISTER_ONLY);
+        first.old_pk_hash = [0; 4];
+        first.old_address_hash = [0; 4];
+        first.old_seed_hash = [0; 3];
+        first.new_pk_hash = NEW_PK;
+        first.user_address = [21u8; 20];
+        first.next_server_seed_hash = [711, 712, 713];
+        let first = commit(first);
+        let eff = validate_slot(&first).expect("first key registration must validate");
+        assert_eq!(eff.new_seed_hash, [711, 712, 713]);
+        assert_eq!(eff.new_root, root_of_effects(&first, &eff));
+
+        // Rotation: old_seed_hash != 0 ⇒ next_server_seed_hash is ignored.
+        let mut rot = registered_user(TX_KEY_REGISTER_ONLY);
+        rot.new_pk_hash = NEW_PK;
+        rot.next_server_seed_hash = [711, 712, 713];
+        let rot = commit(rot);
+        let eff = validate_slot(&rot).expect("key rotation must validate");
+        assert_eq!(eff.new_seed_hash, rot.old_seed_hash);
+        assert_eq!(eff.new_root, root_of_effects(&rot, &eff));
+    }
+
+    #[test]
+    fn zero_seed_commit_is_rejected_on_every_seed_writing_path() {
+        // set_init_seed_hash on leaf 0 with an all-zero commitment.
+        let mut init = registered_user(TX_SET_INIT_SEED_HASH);
+        init.user_id = 0;
+        init.next_server_seed_hash = [0; 3];
+        let init = commit(init);
+        assert_eq!(validate_slot(&init), Err(SlotRejection::ZeroSeedCommit));
+
+        // First key_register (old_seed_hash == 0) installing a zero seed.
+        let mut first = registered_user(TX_KEY_REGISTER_ONLY);
+        first.old_pk_hash = [0; 4];
+        first.old_address_hash = [0; 4];
+        first.old_seed_hash = [0; 3];
+        first.new_pk_hash = NEW_PK;
+        first.user_address = [21u8; 20];
+        first.next_server_seed_hash = [0; 3];
+        let first = commit(first);
+        assert_eq!(validate_slot(&first), Err(SlotRejection::ZeroSeedCommit));
+
+        // A key ROTATION does not write the seed, so a zero
+        // next_server_seed_hash is irrelevant there.
+        let mut rot = registered_user(TX_KEY_REGISTER_ONLY);
+        rot.new_pk_hash = NEW_PK;
+        rot.next_server_seed_hash = [0; 3];
+        let rot = commit(rot);
+        assert!(validate_slot(&rot).is_ok(), "rotation keeps the old seed");
+
+        // Nor does a plain transfer.
+        let mut xfer = registered_user(TX_TRANSFER);
+        xfer.amount = 1;
+        xfer.next_server_seed_hash = [0; 3];
+        let xfer = commit(xfer);
+        assert!(validate_slot(&xfer).is_ok(), "non-seed tx ignores next_server_seed_hash");
     }
 
     #[test]
@@ -826,27 +1387,124 @@ mod tests {
         let eff = validate_slot(&inp).expect("first key registration must validate");
         assert_eq!(eff.new_pk_hash, NEW_PK);
         assert_eq!(eff.new_address_hash, hash::address_hash([21u8; 20]));
+        assert_eq!(eff.new_nonce, inp.old_nonce + ACCOUNT_LANE_UNIT);
         assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
     }
 
     #[test]
-    fn key_rotation_is_signed_but_expiry_exempt() {
-        // Rotation with a valid signature but an EXPIRED session still passes
-        // (key rotation is excluded from the expiry window).
+    fn key_rotation_bumps_account_lane() {
         let mut inp = registered_user(TX_KEY_REGISTER_ONLY);
         inp.new_pk_hash = NEW_PK;
-        inp.max_block_timestamp = SESSION_EXPIRY + 10_000; // expired
         let inp = commit(inp);
-        let eff = validate_slot(&inp).expect("expired key rotation must still validate");
+        let eff = validate_slot(&inp).expect("registration side-circuit authorizes rotation");
         assert_eq!(eff.new_pk_hash, NEW_PK);
         assert_eq!(eff.new_address_hash, inp.old_address_hash); // address kept
+        assert_eq!(split_nonce(eff.new_nonce), (1, 41));
+    }
 
-        // A wrong signature still fails C13.
-        let mut bad = registered_user(TX_KEY_REGISTER_ONLY);
-        bad.new_pk_hash = NEW_PK;
-        bad.session_key[2] ^= 0xFF;
-        let bad = commit(bad);
-        assert_eq!(validate_slot(&bad), Err(SlotRejection::SessionAuthMismatch));
+    #[test]
+    fn nonce_lanes_bump_independently() {
+        // Account lane: withdrawal / transfer / key_register add 2^40 and leave
+        // the low 40 bits alone; game lane: IHB / crash add 1 and leave the
+        // high 23 bits alone. Legacy nonces (< 2^40) decode as (0, n).
+        assert_eq!(split_nonce(41), (0, 41));
+        let packed = join_nonce(5, 123_456_789);
+        assert_eq!(split_nonce(packed), (5, 123_456_789));
+
+        let mut inp = registered_user(TX_TRANSFER);
+        inp.old_nonce = packed;
+        inp.amount = 1;
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("transfer on a two-lane nonce must validate");
+        assert_eq!(split_nonce(eff.new_nonce), (6, 123_456_789));
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (6, 123_456_789));
+
+        let mut inp = registered_user(TX_KEY_REGISTER_ONLY);
+        inp.old_nonce = packed;
+        inp.new_pk_hash = NEW_PK;
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("rotation on a two-lane nonce must validate");
+        assert_eq!(split_nonce(eff.new_nonce), (6, 123_456_789));
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (6, 123_456_789));
+
+        // Unsigned slots leave both lanes untouched.
+        let mut inp = registered_user(TX_NOOP);
+        inp.old_nonce = packed;
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).unwrap();
+        assert_eq!(eff.new_nonce, packed);
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (5, 123_456_789));
+    }
+
+    #[test]
+    fn withdrawal_signed_lane_survives_interleaved_bets() {
+        // The scenario the two lanes exist for: a withdrawal is signed under
+        // account lane N; bets land before it is applied and move only the game
+        // lane, so the account lane the signature committed to is still N.
+        let hot_wallet = [0xABu8; 20];
+        let h = hash::address_hash(hot_wallet);
+        let start = join_nonce(4, 41);
+
+        let mut bet = consistent_ihb(2, 1_000_000, 0, 500, 0);
+        bet.old_nonce = start;
+        let bet = commit(bet);
+        let after_bet = validate_slot(&bet).expect("bet must validate");
+        assert_eq!((after_bet.new_account_nonce, after_bet.new_game_nonce), (4, 42));
+
+        let mut wd = registered_user(TX_WITHDRAWAL);
+        wd.old_nonce = after_bet.new_nonce; // leaf after the bet
+        wd.amount = 750_000;
+        wd.user_address = hot_wallet;
+        wd.recipient_addr_hash = [h[0], h[1]];
+        let wd = commit(wd);
+        let eff = validate_slot(&wd).expect("withdrawal after a bet must validate");
+        // Account lane was 4 when signed and is still 4 at apply time; it bumps
+        // to 5 and the game lane keeps the bet's advance.
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (5, 42));
+        assert_eq!(eff.new_nonce, join_nonce(5, 42));
+    }
+
+    #[test]
+    fn nonce_lane_ceiling_is_typed_rejection() {
+        // Account lane full: account-lane types reject, nothing carries.
+        let full_acct = join_nonce(ACCOUNT_LANE_MAX, 10);
+        for tx_type in [TX_WITHDRAWAL, TX_TRANSFER, TX_KEY_REGISTER_ONLY] {
+            let mut inp = registered_user(tx_type);
+            inp.old_nonce = full_acct;
+            inp.amount = 1;
+            if tx_type == TX_WITHDRAWAL {
+                inp.user_address = [7u8; 20];
+                inp.recipient_addr_hash = recipient_addr_hash_for(tx_type, inp.user_address);
+            }
+            if tx_type == TX_KEY_REGISTER_ONLY {
+                inp.new_pk_hash = NEW_PK;
+            }
+            let inp = commit(inp);
+            assert_eq!(
+                validate_slot(&inp),
+                Err(SlotRejection::NonceLaneOverflow),
+                "tx_type {tx_type} at the account-lane ceiling",
+            );
+        }
+        // A saturated lane that is not bumped is still a storable leaf.
+        let mut inp = registered_user(TX_NOOP);
+        inp.old_nonce = join_nonce(ACCOUNT_LANE_MAX, GAME_LANE_MAX);
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp).unwrap().new_nonce, inp.old_nonce);
+
+        // Game lane full: an account-lane bump still goes through.
+        let mut inp = registered_user(TX_KEY_REGISTER_ONLY);
+        inp.old_nonce = join_nonce(3, GAME_LANE_MAX);
+        inp.new_pk_hash = NEW_PK;
+        let inp = commit(inp);
+        assert_eq!(split_nonce(validate_slot(&inp).unwrap().new_nonce), (4, GAME_LANE_MAX));
+
+        // A canonical leaf nonce outside the 63-bit two-lane range can never
+        // have been produced by the circuit (its `split_le(_, 63)` rejects it).
+        let mut inp = registered_user(TX_NOOP);
+        inp.old_nonce = 1u64 << 63;
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::NonceLaneOverflow));
     }
 
     #[test]
@@ -858,6 +1516,7 @@ mod tests {
         assert_eq!(eff.new_balance, 1_600_000);
         assert_eq!(eff.new_credit, 1_200_000); // 1_600_000 >= credit ⇒ unchanged
         assert_eq!(eff.new_total_liability, 8_600_000);
+        assert_eq!(eff.new_nonce, inp.old_nonce + ACCOUNT_LANE_UNIT);
         assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
     }
 
@@ -938,7 +1597,46 @@ mod tests {
         assert_ne!(eff.random, [0; 4]);
         assert_ne!(eff.slot_h, [0; 4]);
         assert_eq!(eff.new_seed_hash, inp.next_server_seed_hash);
+        assert_eq!(eff.new_nonce, inp.old_nonce + 1); // game-lane bump
         assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
+    }
+
+    #[test]
+    fn ihb_on_crash_house_account_is_rejected() {
+        // F8: leaf 0 holds the crash seed commitment and never bets. An
+        // otherwise fully consistent IHB retargeted at user_id 0 is a typed
+        // rejection before any fairness / payout work.
+        let mut inp = consistent_ihb(2, 1_000_000, 0, 500, 0);
+        inp.user_id = 0;
+        let inp = commit(inp);
+        assert_eq!(
+            validate_slot(&inp),
+            Err(SlotRejection::InHouseBetOnAccountZero),
+        );
+    }
+
+    #[test]
+    fn ihb_bumps_game_lane_only_and_rejects_at_its_ceiling() {
+        // An account that has withdrawn before (account lane 2): a bet moves the
+        // game lane and leaves the account lane alone.
+        let mut inp = consistent_ihb(2, 1_000_000, 0, 500, 0);
+        inp.old_nonce = join_nonce(2, 41);
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("IHB on a two-lane nonce must validate");
+        assert_eq!(split_nonce(eff.new_nonce), (2, 42));
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (2, 42));
+
+        // Game lane at its ceiling: reject, do not carry into the account lane.
+        let mut inp = consistent_ihb(2, 1_000_000, 0, 500, 0);
+        inp.old_nonce = join_nonce(2, GAME_LANE_MAX);
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::NonceLaneOverflow));
+
+        // Account lane at its ceiling does not block a bet.
+        let mut inp = consistent_ihb(2, 1_000_000, 0, 500, 0);
+        inp.old_nonce = join_nonce(ACCOUNT_LANE_MAX, 41);
+        let inp = commit(inp);
+        assert_eq!(split_nonce(validate_slot(&inp).unwrap().new_nonce), (ACCOUNT_LANE_MAX, 42));
     }
 
     #[test]
@@ -1116,7 +1814,24 @@ mod tests {
         assert_ne!(eff.slot_h, [0; 4]);
         // Crash does NOT advance the seed
         assert_eq!(eff.new_seed_hash, inp.old_seed_hash);
+        // ...but it is a game-lane bump like in_house_bet.
+        assert_eq!(eff.new_nonce, inp.old_nonce + 1);
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (0, inp.old_nonce + 1));
         assert_eq!(eff.new_root, root_of_effects(&inp, &eff));
+    }
+
+    #[test]
+    fn crash_settle_on_two_lane_nonce_keeps_account_lane() {
+        let mut inp = consistent_crash(200);
+        inp.old_nonce = join_nonce(9, 41);
+        let inp = commit(inp);
+        let eff = validate_slot(&inp).expect("crash settle on a two-lane nonce must validate");
+        assert_eq!((eff.new_account_nonce, eff.new_game_nonce), (9, 42));
+
+        let mut inp = consistent_crash(200);
+        inp.old_nonce = join_nonce(9, GAME_LANE_MAX);
+        let inp = commit(inp);
+        assert_eq!(validate_slot(&inp), Err(SlotRejection::NonceLaneOverflow));
     }
 
     #[test]

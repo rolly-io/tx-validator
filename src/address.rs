@@ -81,6 +81,42 @@ pub(crate) fn build_address(
     })
 }
 
+/// The `recipient_addr_hash` a slot of `tx_type` paying `user_address` must
+/// carry — and the value every signer commits into `tx_hash` for it:
+/// `Poseidon2(user_address)[0..2]` on a withdrawal (the address the slot pays),
+/// `[0, 0]` for every other type. The engine derives the slot's value from the
+/// withdrawal's destination address with this function, so there is exactly one
+/// source of truth for what the client must have signed.
+pub fn recipient_addr_hash_for(tx_type: u8, user_address: [u8; 20]) -> [u64; 2] {
+    if tx_type == crate::TX_WITHDRAWAL {
+        let h = hash::address_hash(user_address);
+        [h[0], h[1]]
+    } else {
+        [0; 2]
+    }
+}
+
+/// The `recipient_addr_hash` a slot must carry (see [`recipient_addr_hash_for`]).
+pub(crate) fn expected_recipient_addr_hash(input: &SlotInput, flags: &TxFlags) -> [u64; 2] {
+    debug_assert_eq!(flags.is_withdrawal, input.tx_type == crate::TX_WITHDRAWAL);
+    recipient_addr_hash_for(input.tx_type, input.user_address)
+}
+
+/// F6 — payout-destination binding, the native mirror of the `connect` in
+/// `build_address_constraints`. The counterparty the user's Schnorr signature
+/// commits to (`recipient_addr_hash`, folded into `tx_hash`) must be the very
+/// address the withdrawal slot pays out to (`user_address` → opsHash →
+/// `claimable[addr]`); a non-payout slot must carry a zero recipient.
+pub(crate) fn check_recipient_binding(
+    input: &SlotInput,
+    flags: &TxFlags,
+) -> Result<(), SlotRejection> {
+    if input.recipient_addr_hash != expected_recipient_addr_hash(input, flags) {
+        return Err(SlotRejection::RecipientAddrHashMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +222,50 @@ mod tests {
         inp.user_address = addr_bytes(123);
         let e = build_address(&inp, &TxFlags::from_tx_type(TX_WITHDRAWAL)).unwrap();
         assert_eq!(e.new_address_hash, hash::address_hash(addr_bytes(6)));
+    }
+
+    #[test]
+    fn withdrawal_recipient_must_hash_the_paid_address_f6() {
+        let flags = TxFlags::from_tx_type(TX_WITHDRAWAL);
+        let paid = addr_bytes(7);
+        let h = hash::address_hash(paid);
+
+        let mut inp = input(TX_WITHDRAWAL);
+        inp.user_address = paid;
+        inp.recipient_addr_hash = [h[0], h[1]];
+        assert_eq!(check_recipient_binding(&inp, &flags), Ok(()));
+
+        // Signed counterparty A, but the slot pays B: rejected.
+        inp.user_address = addr_bytes(8);
+        assert_eq!(
+            check_recipient_binding(&inp, &flags),
+            Err(SlotRejection::RecipientAddrHashMismatch)
+        );
+
+        // A zero recipient on a withdrawal is rejected too (nothing signed the
+        // payout address).
+        inp.user_address = paid;
+        inp.recipient_addr_hash = [0; 2];
+        assert_eq!(
+            check_recipient_binding(&inp, &flags),
+            Err(SlotRejection::RecipientAddrHashMismatch)
+        );
+    }
+
+    #[test]
+    fn non_withdrawal_recipient_must_be_zero_f6() {
+        for tx in [TX_NOOP, TX_DEPOSIT, TX_KEY_REGISTER_ONLY] {
+            let flags = TxFlags::from_tx_type(tx);
+            let mut inp = input(tx);
+            inp.user_address = addr_bytes(9);
+            assert_eq!(check_recipient_binding(&inp, &flags), Ok(()));
+
+            inp.recipient_addr_hash = [1, 2];
+            assert_eq!(
+                check_recipient_binding(&inp, &flags),
+                Err(SlotRejection::RecipientAddrHashMismatch),
+                "tx_type {tx}"
+            );
+        }
     }
 }

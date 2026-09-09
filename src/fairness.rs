@@ -18,7 +18,7 @@
 use crate::flags::TxFlags;
 use crate::{hash, SlotInput, SlotRejection};
 
-use rolly_game_core::{crash, coinflip, dice, keno, limbo, plinko};
+use rolly_game_core::{blackjack, crash, coinflip, dice, keno, limbo, plinko};
 
 /// Post-fairness effects consumed by `compute_effects` to build `SlotEffects`.
 #[derive(Clone, Debug, PartialEq)]
@@ -232,6 +232,25 @@ fn dispatch_payout(
             }
             let payout = coinflip::compute_payout(random, bet, prediction);
             Ok(payout.win_amount)
+        }
+        id if id == blackjack::BLACKJACK_GAME_ID => {
+            // Blackjack's win is NOT derived from `random`: it replays the round
+            // over the fair shoe (`Poseidon2(server_seed ‖ user_secret_random)`)
+            // and the packed action list, starting from `base_bet`. The slot
+            // records the TOTAL staked, which the round replay also produces, so
+            // a mismatched total means a tampered stake / deck secret / actions.
+            let result = crate::blackjack::compute_payout(
+                &input.server_seed,
+                &input.user_secret_random,
+                input.prediction_lo,
+                input.prediction_hi,
+                input.base_bet,
+            )
+            .ok_or(SlotRejection::PayoutMismatch)?;
+            if result.total_staked != bet {
+                return Err(SlotRejection::PayoutMismatch);
+            }
+            Ok(result.payout.win_amount)
         }
         _ => Err(SlotRejection::PayoutMismatch),
     }
@@ -736,6 +755,79 @@ mod tests {
                 "{label} must be rejected without panicking",
             );
         }
+    }
+
+    // ── Blackjack (shoe-derived payout, not random-derived) ──
+
+    #[test]
+    fn ihb_blackjack_payout_correct() {
+        use rolly_game_core::blackjack::ACTION_STAND;
+
+        let ss = [101u64, 202, 303, 404, 505, 606, 707, 808];
+        let secret = [11u64, 22, 33, 44];
+        let base_bet = 1_000_000u64;
+
+        // Single STAND action, packed base-8 into prediction_lo (game_mode = 0
+        // for blackjack, exactly as the circuit derives the prediction hash).
+        let prediction_lo = ACTION_STAND as u32;
+        let prediction_hi = 0u32;
+
+        // The slot records the TOTAL staked + the win, both from the replay.
+        let round = crate::blackjack::compute_payout(
+            &ss, &secret, prediction_lo, prediction_hi, base_bet,
+        )
+        .expect("valid blackjack round");
+        let total_staked = round.total_staked;
+        let win = round.payout.win_amount;
+
+        let prediction_hash = hash::prediction_hash_standard(
+            blackjack::BLACKJACK_GAME_ID as u64,
+            0,
+            prediction_lo as u64,
+            prediction_hi as u64,
+        );
+        // user_seed binds the TOTAL staked (same as the block/circuit), and the
+        // player's secret also seeds the shoe — pinning the deck into slot_h.
+        let user_seed = hash::user_seed_binding(
+            blackjack::BLACKJACK_GAME_ID as u64,
+            total_staked,
+            prediction_hash,
+            secret,
+        );
+
+        let inp = SlotInput {
+            tx_type: crate::TX_IN_HOUSE_BET,
+            game_id: blackjack::BLACKJACK_GAME_ID,
+            amount: total_staked,
+            win_amount: win,
+            server_seed: ss,
+            user_seed,
+            old_seed_hash: hash::seed_hash_truncated(ss),
+            next_server_seed_hash: [701, 702, 703],
+            user_secret_random: secret,
+            prediction_hash,
+            game_mode: 0,
+            prediction_lo,
+            prediction_hi,
+            base_bet,
+            ..SlotInput::default()
+        };
+
+        let eff = check_fairness(&inp, &flags_ihb());
+        assert!(eff.is_ok(), "valid blackjack IHB must pass: {eff:?}");
+
+        // A tampered recorded win breaks the payout defense-in-depth check.
+        let mut wrong_win = inp.clone();
+        wrong_win.win_amount = win.wrapping_add(1);
+        assert_eq!(
+            check_fairness(&wrong_win, &flags_ihb()),
+            Err(SlotRejection::PayoutMismatch),
+        );
+
+        // A tampered total stake diverges from the replayed total.
+        let mut wrong_stake = inp.clone();
+        wrong_stake.amount = total_staked + 1;
+        assert!(check_fairness(&wrong_stake, &flags_ihb()).is_err());
     }
 
     // ── slot_h matches manual computation ──

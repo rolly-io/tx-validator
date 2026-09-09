@@ -31,15 +31,40 @@ pub fn poseidon2(input: &[u64]) -> [u64; 4] {
     core::array::from_fn(|j| h.elements[j].to_canonical_u64())
 }
 
-/// `balance_hash` (7 elements):
-/// `Poseidon2(balance_lo, balance_hi, seed_hash[0..3], credit_lo, credit_hi)`.
+/// `balance_hash` (8 elements):
+/// `Poseidon2(balance_lo_field, balance_hi_field, seed_hash[0..3], credit_lo, credit_hi, nonce)`.
 ///
-/// circuit `build_user_leaf` (slot/leaf.rs); wasm `hash_balance_leaf`;
-/// TS `toRawLeaf`. The `lo`/`hi` split is `lo = v & 0xFFFFFFFF`, `hi = v >> 32`.
-pub fn balance_leaf(balance: u64, seed_hash: [u64; 3], credit: u64) -> [u64; 4] {
-    let (b_lo, b_hi) = split_u64(balance);
+/// The two leading fields PACK the u32 balance limbs with the two 31-bit halves
+/// of the 62-bit provider `allowance` (`field::pack_balance_fields`):
+/// `allow_a·2^32 + balance_lo`, `allow_b·2^32 + balance_hi`. With
+/// `allowance == 0` they are the bare limbs, so every pre-allowance leaf hashes
+/// exactly as before. `credit_lo` / `credit_hi` stay pure u32 limbs.
+///
+/// circuit `build_user_leaf` (slot/leaf.rs) fed by `pack_limb_field`; native
+/// `leaf_ops::u64_to_leaf_with_allowance`. The `lo`/`hi` split is
+/// `lo = v & 0xFFFFFFFF`, `hi = v >> 32`.
+///
+/// # Panics
+/// If `allowance > PROVIDER_ALLOWANCE_MAX` (no leaf representation).
+pub fn balance_leaf(
+    balance: u64,
+    seed_hash: [u64; 3],
+    credit: u64,
+    nonce: u64,
+    allowance: u64,
+) -> [u64; 4] {
+    let [b_lo, b_hi] = crate::field::pack_balance_fields(balance, allowance);
     let (c_lo, c_hi) = split_u64(credit);
-    poseidon2(&[b_lo, b_hi, seed_hash[0], seed_hash[1], seed_hash[2], c_lo, c_hi])
+    poseidon2(&[
+        b_lo,
+        b_hi,
+        seed_hash[0],
+        seed_hash[1],
+        seed_hash[2],
+        c_lo,
+        c_hi,
+        nonce,
+    ])
 }
 
 /// `main_leaf` (8 elements):
@@ -74,21 +99,14 @@ pub fn two_to_one(left: [u64; 4], right: [u64; 4]) -> [u64; 4] {
     ])
 }
 
-/// Session public-key hash `pk_hash` (5 elements):
-/// `Poseidon2(session_key[0..4], session_expiry)`.
+/// Schnorr public-key commitment (5 elements):
+/// `Poseidon2(schnorr_pk_enc[0..5])`.
 ///
-/// circuit `build_auth_constraints` (slot/auth.rs); wasm `session_public_key`.
-/// This is the authority bound into the leaf: the auth check (C13) requires
-/// `session_pk_hash(session_key, expiry) == old_pk_hash[0..4]` for any signed
-/// tx, so a stale or forged `session_key`/`expiry` pair cannot authorize a slot.
-pub fn session_pk_hash(session_key: [u64; 4], session_expiry: u64) -> [u64; 4] {
-    poseidon2(&[
-        session_key[0],
-        session_key[1],
-        session_key[2],
-        session_key[3],
-        session_expiry,
-    ])
+/// The state leaf stores only the first two hash limbs. The commitment is
+/// intentionally not domain-separated from the retired 5-element session
+/// preimage; Schnorr authorization still requires the point's discrete log.
+pub fn schnorr_pk_hash(schnorr_pk_enc: [u64; 5]) -> [u64; 4] {
+    poseidon2(&schnorr_pk_enc)
 }
 
 /// Address hash (20 elements, byte-wise): `Poseidon2(user_address[0..20])`.
@@ -263,17 +281,42 @@ mod tests {
         let balance = (7u64 << 32) | 3;
         let credit = (9u64 << 32) | 5;
         let seed = [111u64, 222, 333];
-        let expected = poseidon2(&[3, 7, 111, 222, 333, 5, 9]);
-        assert_eq!(balance_leaf(balance, seed, credit), expected);
+        let expected = poseidon2(&[3, 7, 111, 222, 333, 5, 9, 17]);
+        assert_eq!(balance_leaf(balance, seed, credit, 17, 0), expected);
+    }
+
+    /// Provider allowance: `allowance = 0` is the legacy leaf byte-for-byte
+    /// (same hash ⇒ same state root / `EXPECTED_EMPTY_ROOT`); a non-zero
+    /// allowance lands its two 31-bit halves ABOVE the balance limbs in fields
+    /// 0 / 1 and changes the hash.
+    #[test]
+    fn balance_leaf_packs_allowance_above_balance_limbs() {
+        let balance = (7u64 << 32) | 3;
+        let credit = (9u64 << 32) | 5;
+        let seed = [111u64, 222, 333];
+        let allowance = (5u64 << 31) | 0x1234_5678; // both halves non-zero
+        let legacy = balance_leaf(balance, seed, credit, 17, 0);
+        let packed = balance_leaf(balance, seed, credit, 17, allowance);
+        assert_ne!(legacy, packed);
+        assert_eq!(
+            packed,
+            poseidon2(&[(0x1234_5678u64 << 32) | 3, (5u64 << 32) | 7, 111, 222, 333, 5, 9, 17]),
+        );
+        // Full 62-bit range is representable; 2^62 is not.
+        let _ = balance_leaf(balance, seed, credit, 17, crate::field::PROVIDER_ALLOWANCE_MAX);
+        assert!(
+            std::panic::catch_unwind(|| balance_leaf(0, [0; 3], 0, 0, 1u64 << 62)).is_err(),
+            "allowance ≥ 2^62 has no leaf representation",
+        );
     }
 
     #[test]
-    fn session_pk_hash_matches_manual_layout() {
-        let key = [1u64, 2, 3, 4];
-        let expiry = 1_700_000_000u64;
-        assert_eq!(session_pk_hash(key, expiry), poseidon2(&[1, 2, 3, 4, expiry]));
-        // expiry participates: changing it changes the hash.
-        assert_ne!(session_pk_hash(key, expiry), session_pk_hash(key, expiry + 1));
+    fn schnorr_pk_hash_matches_manual_layout() {
+        let key = [1u64, 2, 3, 4, 5];
+        assert_eq!(schnorr_pk_hash(key), poseidon2(&key));
+        let mut changed = key;
+        changed[4] += 1;
+        assert_ne!(schnorr_pk_hash(key), schnorr_pk_hash(changed));
     }
 
     #[test]
@@ -297,13 +340,21 @@ mod tests {
 
     #[test]
     fn pin_balance_leaf() {
-        let h = balance_leaf(1_000_000, [100, 200, 300], 500_000);
+        let h = balance_leaf(1_000_000, [100, 200, 300], 500_000, 9, 0);
         // Snapshot: if the field order changes, this breaks.
-        assert_eq!(h, balance_leaf(1_000_000, [100, 200, 300], 500_000));
+        assert_eq!(h, balance_leaf(1_000_000, [100, 200, 300], 500_000, 9, 0));
         // Changing ANY participating field MUST produce a different hash.
-        assert_ne!(h, balance_leaf(1_000_001, [100, 200, 300], 500_000));
-        assert_ne!(h, balance_leaf(1_000_000, [101, 200, 300], 500_000));
-        assert_ne!(h, balance_leaf(1_000_000, [100, 200, 300], 500_001));
+        assert_ne!(h, balance_leaf(1_000_001, [100, 200, 300], 500_000, 9, 0));
+        assert_ne!(h, balance_leaf(1_000_000, [101, 200, 300], 500_000, 9, 0));
+        assert_ne!(h, balance_leaf(1_000_000, [100, 200, 300], 500_001, 9, 0));
+        assert_ne!(h, balance_leaf(1_000_000, [100, 200, 300], 500_000, 10, 0));
+        assert_ne!(h, balance_leaf(1_000_000, [100, 200, 300], 500_000, 9, 1));
+    }
+
+    #[test]
+    fn zero_nonce_preserves_retired_seven_field_leaf() {
+        let old = poseidon2(&[3, 7, 111, 222, 333, 5, 9]);
+        assert_eq!(balance_leaf((7 << 32) | 3, [111, 222, 333], (9 << 32) | 5, 0, 0), old);
     }
 
     #[test]
